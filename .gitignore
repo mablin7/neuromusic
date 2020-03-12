@@ -1,0 +1,13 @@
+.ipynb_checkpoints
+.vscode
+data
+fluidsynth
+neuromusic/runs
+neuromusic/synth
+neuromusic/__pycache__
+neuromusic/magenta
+neuromusic/*.json
+neuromusic/*.npz
+venv
+
+*.ipynb
