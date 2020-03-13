@@ -10,7 +10,7 @@ DATA = '/storage/piano_data.npz'
 
 if __name__ == "__main__":
     train_loader, test_loader = get_data(DATA)
-    trainer = VAETrainer(def_hparams, train_loader, test_loader)
+    trainer = VAETrainer(def_hparams, train_loader, test_loader, log_base_dir='/storage/runs')
     trainer.train(100)
     # trainer._train_epoch()
     # from torch.utils.tensorboard import SummaryWriter
