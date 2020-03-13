@@ -193,20 +193,14 @@ class VAETrainer():
             x = batch.to(self.device)
             self.optim.zero_grad()
             
-            print('running model')
             out, (mu, logvar) = self.model(x)
             loss = self._loss_function(out, x, mu, logvar)
             
-            print('backward')
-            with torch.autograd.profiler.profile() as prof2:
-                loss.backward()
-            print(prof2.key_averages().table(sort_by="self_cpu_time_total"))
-
-            return
-            # self.optim.step()
-            # train_loss += loss.item()
-            # batches += 1
-        # return train_loss / batches
+            loss.backward()
+            self.optim.step()
+            train_loss += loss.item()
+            batches += 1
+        return train_loss / batches
     
     def train(self, n_epochs, checkpoint_freq=10):
         hp_dict = dict(self.hparams._asdict())

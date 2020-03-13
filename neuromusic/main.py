@@ -6,11 +6,13 @@ import torch.nn.functional as F
 
 INPUT_SPACE = 130
 
-if __name__ == "__main__":
-    train_loader, test_loader = get_data('testdata.npz')
-    trainer = VAETrainer(def_hparams, train_loader, test_loader)
+DATA = '/storage/piano_data.npz'
 
-    trainer._train_epoch()
+if __name__ == "__main__":
+    train_loader, test_loader = get_data(DATA)
+    trainer = VAETrainer(def_hparams, train_loader, test_loader)
+    trainer.train(100)
+    # trainer._train_epoch()
     # from torch.utils.tensorboard import SummaryWriter
     # default `log_dir` is "runs" - we'll be more specific here
     # writer = SummaryWriter('runs/musicvae2/logs')
