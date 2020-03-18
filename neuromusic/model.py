@@ -1,8 +1,11 @@
 import os
+import sys
 import numpy as np
 import torch
 from torch import nn as nn
 import torch.nn.functional as F
+
+import pytorch_lightning as pl
 
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
@@ -12,9 +15,14 @@ from collections import namedtuple
 from tqdm import tqdm
 from hyperdash import Experiment
 
-import torchsnooper
+from data import MelodySequenceDataset
+
+# import torchsnooper
+# import snoop
+# torchsnooper.register_snoop()
 
 INPUT_SPACE = 130
+TRAIN_RATIO = 0.8
 
 # use_cuda = torch.cuda.is_available()
 # device = torch.device("cuda" if use_cuda else "cpu")
@@ -44,11 +52,17 @@ def_hparams = HParams(**def_hparams_dict)
 #     0.2# dropout_rate=0.2
 # )
 
-class MusicVAE(nn.Module):
-    def __init__(self, hparams: HParams, use_cuda):
+class MusicVAE(pl.LightningModule):
+    def __init__(self, hparams: HParams, hdf_file, use_cuda=None, data_in_memory=False):
         super(MusicVAE, self).__init__()
         self._hparams = hparams
-        self.use_cuda = use_cuda
+        self.hdf_file = hdf_file
+        self.data_in_memory = data_in_memory
+        
+        if use_cuda is None:
+            self.use_cuda = torch.cuda.is_available()
+        else:
+            self.use_cuda = use_cuda and torch.cuda.is_available()
         
         self.encoderLSTM = nn.LSTM(
             input_size=INPUT_SPACE,
@@ -84,8 +98,43 @@ class MusicVAE(nn.Module):
             input_size=INPUT_SPACE+hparams.dec_size, # pass the last output from the prevous group
             hidden_size=INPUT_SPACE
         )
+    
+    # DATA
+    def prepare_data(self):
+        self.dataset = MelodySequenceDataset(self.hdf_file, in_memory=self.data_in_memory)
+        dl = len(self.dataset)
+        train_l = int(TRAIN_RATIO * dl)
+        test_l = dl - train_l
+        self.train_set, self.test_set = data.random_split(dataset, [train_l, test_l])
+    
+    def train_dataloader(self):
+        train_loader = data.DataLoader(train_set, batch_size=None)
+        return train_loader
+    
+    def test_dataloader(self):
+        test_loader = data.DataLoader(test_set, batch_size=None)
+        return test_loader
 
-    @torchsnooper.snoop()
+    def val_dataloader(self):
+        test_loader = data.DataLoader(test_set, batch_size=None)
+        return test_loader
+    
+    # LOSS
+    def get_kl_div(self, recon_x, x, mu, logvar):
+        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return BCE + KLD
+    
+    def get_recon_loss(self, recon_x, x, mu, logvar):
+        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return BCE + KLD
+    
+    def get_total_loss(self, kld, bce):
+        return bce + kld
+    
+    
+    # MODEL
     def _encode(self, x):
         # x: (batch, seq_len*16, INPUT_SPACE)
         z_seq, _ = self.encoderLSTM(x) # z_seq: (batch, seq_len*16, enc_size*2)
@@ -150,14 +199,10 @@ class MusicVAE(nn.Module):
             return_val = (return_val, (cond_h, cond_c))
         return return_val
     
-    @torchsnooper.snoop()
     def forward(self, input):
         # input: (batch, seq_len*16, INPUT_SPACE)
         batch = input.shape[0]
         seq_len = input.shape[1]//16
-        
-        self.encoderLSTM.flatten_parameters()
-        
                 
         # mu, logvar = torch.randn((1, def_hparams.z_size)), torch.randn((1, def_hparams.z_size))
         mu, logvar = self._encode(input) # mu, logvar: (batch, z_size)
@@ -175,7 +220,7 @@ class VAETrainer():
         if use_cuda is None:
             self.use_cuda = torch.cuda.is_available()
         else:
-            self.use_cuda = use_cuda
+            self.use_cuda = use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         
         self.train_loader = train_loader
@@ -202,20 +247,28 @@ class VAETrainer():
         BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return BCE + KLD
-    @torchsnooper.snoop()
-    def _onehot(self, batch):
-        batch = batch.unsqueeze_(2)
-        if self.use_cuda:
-            batch = batch.to(self.device)
-            return torch.cuda.FloatTensor(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
-        else:
-            return torch.empty(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
+
+#     @snoop
+    def _onehot(self, in_batch):
+        try:
+            batch = in_batch.unsqueeze_(2)
+            if self.use_cuda:
+                batch = batch.to(self.device)
+                return torch.cuda.FloatTensor(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
+            else:
+                return torch.empty(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
+        except RuntimeError as e:
+            torch.save({
+                'error': e,
+                'tensor': in_batch
+            }, f'error-tensor.pt')
+            raise e
     
     def test(self):
         self.model.eval()
         test_loss = 0
         batches = 0
-        with torch.no_grad():
+        with tqdm(self.test_loader, total=len(self.test_loader), desc='Testing batch', file=sys.stdout):
             for batch in (self.test_loader):
                 x = self._onehot(batch)
                 out, (mu, logvar) = self.model(x)
@@ -229,7 +282,7 @@ class VAETrainer():
         self.model.train()
         train_loss = 0
         batches = 0
-        for batch in (self.train_loader):
+        for batch in tqdm(self.train_loader, total=len(self.train_loader), desc='Training batch', file=sys.stdout):
             x = self._onehot(batch)
             self.optim.zero_grad()
             
