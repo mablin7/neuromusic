@@ -1,6 +1,5 @@
 from collections import defaultdict, namedtuple
 import os
-import math
 from process import run_parallel
 from pretty_midi import PrettyMIDI
 import uuid
@@ -48,15 +47,15 @@ def proc(midifile, log):
         q_notes = defaultdict(list) # { start: Note[] }
         last_step = -1
         for note in instrument.notes:
-            q_start = int(math.round(note.start * steps_per_sec))
-            q_end = int(math.round(note.end * steps_per_sec))
+            q_start = round(note.start * steps_per_sec)
+            q_end = round(note.end * steps_per_sec)
             # Make sure that start and end aren't on the same step
             if q_start == q_end:
                 q_end += 1
             q_notes[q_start].append(Note(note.pitch, q_end))
             # Find last step
             if q_end > last_step:
-                last_step = q_end
+                last_step = int(q_end)
         # Then go over each step, and find the highest pitch for each
         pitch_seq = []
         curr_note = PauseNote

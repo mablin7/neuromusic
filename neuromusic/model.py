@@ -5,12 +5,19 @@ from torch import nn as nn
 import torch.nn.functional as F
 
 from datetime import datetime
-# from tensorboardX import SummaryWriter
 from torch.utils.tensorboard import SummaryWriter
 
 from collections import namedtuple
 
+from tqdm import tqdm
+from hyperdash import Experiment
+
+import torchsnooper
+
 INPUT_SPACE = 130
+
+# use_cuda = torch.cuda.is_available()
+# device = torch.device("cuda" if use_cuda else "cpu")
 
 def_hparams_dict = {
     'batch_size': 256,
@@ -38,10 +45,10 @@ def_hparams = HParams(**def_hparams_dict)
 # )
 
 class MusicVAE(nn.Module):
-    def __init__(self, hparams: HParams):
+    def __init__(self, hparams: HParams, use_cuda):
         super(MusicVAE, self).__init__()
         self._hparams = hparams
-        self.batch = 1
+        self.use_cuda = use_cuda
         
         self.encoderLSTM = nn.LSTM(
             input_size=INPUT_SPACE,
@@ -78,9 +85,10 @@ class MusicVAE(nn.Module):
             hidden_size=INPUT_SPACE
         )
 
+    @torchsnooper.snoop()
     def _encode(self, x):
         # x: (batch, seq_len*16, INPUT_SPACE)
-        z_seq, _ = self.encoderLSTM(x.view(self.batch, -1, INPUT_SPACE)) # z_seq: (batch, seq_len*16, enc_size*2)
+        z_seq, _ = self.encoderLSTM(x) # z_seq: (batch, seq_len*16, enc_size*2)
         z1 = z_seq[:, -1] # z1: (batch, enc_size*2)
         z1 = self.dropout(z1)
         return F.relu(self.mu(z1)), F.relu(self.logvar(z1)) # (batch, z_size)
@@ -101,7 +109,11 @@ class MusicVAE(nn.Module):
         dec_init = F.relu(self.c_linear(self.dropout(cond_out))) # dec_init: (batch, dec_size)
         
         notes = []
-        dec_h, dec_c = torch.zeros(batch, INPUT_SPACE), torch.zeros(batch, INPUT_SPACE)
+        if self.use_cuda:
+            dec_h = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_()
+            dec_c = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_()
+        else:
+            dec_h, dec_c = torch.zeros(batch, INPUT_SPACE), torch.zeros(batch, INPUT_SPACE)
         for i in range(16):
             dec_in = torch.cat((last_note, dec_init), dim=1) # dec_in: (batch, INPUT_SPACE+dec_size)
             dec_h, dec_c = self.decoderLSTM(dec_in, (dec_h, dec_c)) # dec_h: (batch, INPUT_SPACE)
@@ -118,8 +130,13 @@ class MusicVAE(nn.Module):
         cond_size = self._hparams.cond_size
         
         cond_init = F.relu(self.z_linear(self.dropout(z))) # z2: (batch, cond_size)
-        cond_h, cond_c = torch.zeros(batch, cond_size), torch.zeros(batch, cond_size) # cond_h: (batch, cond_size)
-        last_note = torch.zeros(batch, INPUT_SPACE) # last_note: (batch, INPUT_SPACE)
+        if self.use_cuda:
+            cond_h = torch.cuda.FloatTensor(batch, cond_size).zero_() # cond_h: (batch, cond_size)
+            cond_c = torch.cuda.FloatTensor(batch, cond_size).zero_()
+            last_note = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_() # last_note: (batch, INPUT_SPACE)
+        else:
+            cond_h, cond_c = torch.zeros(batch, cond_size), torch.zeros(batch, cond_size) # cond_h: (batch, cond_size)
+            last_note = torch.zeros(batch, INPUT_SPACE) # last_note: (batch, INPUT_SPACE)
         notes = []
         for i in range(seq_len):
             new_notes, cond_h, cond_c = self._decode_single_bar(last_note, cond_init, cond_h, cond_c) # new_notes [(batch, INPUT_SPACE)]
@@ -132,12 +149,16 @@ class MusicVAE(nn.Module):
         if return_cond_state:
             return_val = (return_val, (cond_h, cond_c))
         return return_val
-        
+    
+    @torchsnooper.snoop()
     def forward(self, input):
         # input: (batch, seq_len*16, INPUT_SPACE)
         batch = input.shape[0]
         seq_len = input.shape[1]//16
         
+        self.encoderLSTM.flatten_parameters()
+        
+                
         # mu, logvar = torch.randn((1, def_hparams.z_size)), torch.randn((1, def_hparams.z_size))
         mu, logvar = self._encode(input) # mu, logvar: (batch, z_size)
         
@@ -147,14 +168,20 @@ class MusicVAE(nn.Module):
         return out, (mu, logvar)
 
 class VAETrainer():
-    def __init__(self, hparams: HParams, train_loader, test_loader, log_base_dir='runs'):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, hparams: HParams, train_loader, test_loader, use_cuda=None, log_base_dir='runs'):
         self.hparams = hparams
+        self.hp_dict = dict(self.hparams._asdict())
+        
+        if use_cuda is None:
+            self.use_cuda = torch.cuda.is_available()
+        else:
+            self.use_cuda = use_cuda
+        self.device = torch.device("cuda" if self.use_cuda else "cpu")
         
         self.train_loader = train_loader
         self.test_loader = test_loader
         
-        self.model = MusicVAE(hparams).to(self.device)
+        self.model = MusicVAE(hparams, self.use_cuda).to(self.device)
         self.optim = torch.optim.Adam(self.model.parameters(), lr=hparams.lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optim, hparams.lr_decay)
         
@@ -165,18 +192,32 @@ class VAETrainer():
         
         self.checkpoint_dir = os.path.join(base_dir, 'checkpoints')
         
+#         self.exp = Experiment('Music VAE')
+#         print('Hyperparameters: ')
+#         for k, v in self.hp_dict.items():
+#             self.exp.param(k, v)
+#         print()
+        
     def _loss_function(self, recon_x, x, mu, logvar):
         BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return BCE + KLD
+    @torchsnooper.snoop()
+    def _onehot(self, batch):
+        batch = batch.unsqueeze_(2)
+        if self.use_cuda:
+            batch = batch.to(self.device)
+            return torch.cuda.FloatTensor(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
+        else:
+            return torch.empty(batch.shape[0], batch.shape[1], INPUT_SPACE).scatter_(2, batch, 1)
     
     def test(self):
         self.model.eval()
         test_loss = 0
         batches = 0
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self.test_loader):
-                x = batch.to(self.device)
+            for batch in (self.test_loader):
+                x = self._onehot(batch)
                 out, (mu, logvar) = self.model(x)
                 loss = self._loss_function(out, x, mu, logvar)
                 
@@ -188,12 +229,12 @@ class VAETrainer():
         self.model.train()
         train_loss = 0
         batches = 0
-        for batch_idx, batch in enumerate(self.train_loader):
-            
-            x = batch.to(self.device)
+        for batch in (self.train_loader):
+            x = self._onehot(batch)
             self.optim.zero_grad()
             
             out, (mu, logvar) = self.model(x)
+
             loss = self._loss_function(out, x, mu, logvar)
             
             loss.backward()
@@ -203,22 +244,26 @@ class VAETrainer():
         return train_loss / batches
     
     def train(self, n_epochs, checkpoint_freq=10):
-        hp_dict = dict(self.hparams._asdict())
+        print(f'Train for {n_epochs} epochs')
         for epoch in range(n_epochs):
+            print(f'Epoch {epoch}/{n_epochs}...', end='')
             train_loss = self._train_epoch()
+            
             self.writer.add_scalar('train_loss', train_loss)
+            self.exp.metric('train_loss', train_loss)
             
             test_loss = self.test()
+            
             self.writer.add_scalar('test_loss', test_loss)
+            self.exp.metric('test_loss', test_loss)
             
             self.scheduler.step(epoch)
             
-            
-            if epoch == 0:
-                self.writer.add_graph(self.model)
+            print(f'\rEpoch {epoch}/{n_epochs}: training_loss={train_loss} test_loss={test_loss}')
             
             if epoch % checkpoint_freq == 0:
-                self.writer.add_hparams(hp_dict, {'hparam/loss': test_loss})
+                print('Saving checkpoint...')
+                self.writer.add_hparams(self.hp_dict, {'hparam/loss': test_loss})
                 path = os.path.join(self.checkpoint_dir, f'epoch-{epoch}.pt')
                 torch.save({
                     'epoch': epoch,
@@ -228,4 +273,5 @@ class VAETrainer():
                     'train_loss': train_loss,
                     'test_loss': test_loss
                 })
-            
+        self.writer.close()
+        self.exp.end()
