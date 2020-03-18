@@ -1,21 +1,18 @@
 import os
 import sys
+import math
+from glob import glob
+from datetime import datetime
+from collections import namedtuple
+
 import numpy as np
 import torch
 from torch import nn as nn
 import torch.nn.functional as F
 
-import pytorch_lightning as pl
-
-from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
-
-from collections import namedtuple
-
 from tqdm import tqdm
 from hyperdash import Experiment
-
-from data import MelodySequenceDataset
+from torch.utils.tensorboard import SummaryWriter
 
 # import torchsnooper
 # import snoop
@@ -23,9 +20,6 @@ from data import MelodySequenceDataset
 
 INPUT_SPACE = 130
 TRAIN_RATIO = 0.8
-
-# use_cuda = torch.cuda.is_available()
-# device = torch.device("cuda" if use_cuda else "cpu")
 
 def_hparams_dict = {
     'batch_size': 256,
@@ -35,34 +29,47 @@ def_hparams_dict = {
     'enc_size': 512,
     'cond_size':128,
     'dec_size': 512,
-    'dropout_rate': 0.2
+    'dropout_rate': 0.2,
+    'beta_rate': 0.99999,
+    'max_beta': 0.2,
+    'free_bits': 48
 }
 HParams = namedtuple('HParams', sorted(def_hparams_dict))
 def_hparams = HParams(**def_hparams_dict)
-# HParams = namedtuple('HParams', [ 'batch_size', 'lr', 'lr_decay' 'z_size', 
-#                                  'enc_size', 'cond_size', 'dec_size', 'dropout_rate' ])
-# def_hparams = HParams(
-#     256,#batch_size
-#     0.001,# lr=1e-3,
-#     0.9999,# lr_decay=0.9999,
-#     256,# z_size=256,
-#     512,# enc_size=512,
-#     128,# cond_size=128,
-#     512,# dec_size=512,
-#     0.2# dropout_rate=0.2
-# )
 
-class MusicVAE(pl.LightningModule):
-    def __init__(self, hparams: HParams, hdf_file, use_cuda=None, data_in_memory=False):
+
+class MelodySequenceDataset(torch.utils.data.Dataset):
+    def __init__(self, batch_dir, subset=None):
+        super(MelodySequenceDataset, self).__init__()
+        self.files = glob(os.path.join(batch_dir, '*.npy'))
+        self.subset = subset
+    
+    def __len__(self):
+        return len(self.files) if self.subset is None else min(self.subset, len(self.files))
+    
+    def __getitem__(self, index):
+        dat = torch.as_tensor(np.load(self.files[index]))
+        return dat
+
+def get_data(batch_dir):
+    dataset = MelodySequenceDataset(batch_dir)
+    # Split into train and test
+    dl = len(dataset)
+    train_l = int(TRAIN_RATIO * dl)
+    test_l = dl - train_l
+    train_set, test_set = torch.utils.data.random_split(dataset, [train_l, test_l])
+    # DataLoaders
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size=None)
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size=None)
+    return train_loader, test_loader
+
+
+class MusicVAE(nn.Module):
+    def __init__(self, hparams: HParams):
         super(MusicVAE, self).__init__()
         self._hparams = hparams
-        self.hdf_file = hdf_file
-        self.data_in_memory = data_in_memory
-        
-        if use_cuda is None:
-            self.use_cuda = torch.cuda.is_available()
-        else:
-            self.use_cuda = use_cuda and torch.cuda.is_available()
+            
+        self.step = 0
         
         self.encoderLSTM = nn.LSTM(
             input_size=INPUT_SPACE,
@@ -98,42 +105,7 @@ class MusicVAE(pl.LightningModule):
             input_size=INPUT_SPACE+hparams.dec_size, # pass the last output from the prevous group
             hidden_size=INPUT_SPACE
         )
-    
-    # DATA
-    def prepare_data(self):
-        self.dataset = MelodySequenceDataset(self.hdf_file, in_memory=self.data_in_memory)
-        dl = len(self.dataset)
-        train_l = int(TRAIN_RATIO * dl)
-        test_l = dl - train_l
-        self.train_set, self.test_set = data.random_split(dataset, [train_l, test_l])
-    
-    def train_dataloader(self):
-        train_loader = data.DataLoader(train_set, batch_size=None)
-        return train_loader
-    
-    def test_dataloader(self):
-        test_loader = data.DataLoader(test_set, batch_size=None)
-        return test_loader
 
-    def val_dataloader(self):
-        test_loader = data.DataLoader(test_set, batch_size=None)
-        return test_loader
-    
-    # LOSS
-    def get_kl_div(self, recon_x, x, mu, logvar):
-        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + KLD
-    
-    def get_recon_loss(self, recon_x, x, mu, logvar):
-        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + KLD
-    
-    def get_total_loss(self, kld, bce):
-        return bce + kld
-    
-    
     # MODEL
     def _encode(self, x):
         # x: (batch, seq_len*16, INPUT_SPACE)
@@ -158,11 +130,11 @@ class MusicVAE(pl.LightningModule):
         dec_init = F.relu(self.c_linear(self.dropout(cond_out))) # dec_init: (batch, dec_size)
         
         notes = []
-        if self.use_cuda:
-            dec_h = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_()
-            dec_c = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_()
-        else:
-            dec_h, dec_c = torch.zeros(batch, INPUT_SPACE), torch.zeros(batch, INPUT_SPACE)
+        
+        device = cond_initial.device
+        dec_h = torch.zeros(batch, INPUT_SPACE, device=device)
+        dec_c = torch.zeros(batch, INPUT_SPACE, device=device)
+
         for i in range(16):
             dec_in = torch.cat((last_note, dec_init), dim=1) # dec_in: (batch, INPUT_SPACE+dec_size)
             dec_h, dec_c = self.decoderLSTM(dec_in, (dec_h, dec_c)) # dec_h: (batch, INPUT_SPACE)
@@ -172,20 +144,18 @@ class MusicVAE(pl.LightningModule):
         # notes_tensor = torch.cat(notes).view(notes[0].shape[0], 16, -1) # notes: (batch, 16, INPUT_SPACE)
         return notes, cond_out, cond_cell
             
-    
     def _decode(self, z, seq_len=1, return_tensor=True, return_cond_state=False):
         # z: (batch, z_size)
         batch = z.shape[0]
         cond_size = self._hparams.cond_size
         
         cond_init = F.relu(self.z_linear(self.dropout(z))) # z2: (batch, cond_size)
-        if self.use_cuda:
-            cond_h = torch.cuda.FloatTensor(batch, cond_size).zero_() # cond_h: (batch, cond_size)
-            cond_c = torch.cuda.FloatTensor(batch, cond_size).zero_()
-            last_note = torch.cuda.FloatTensor(batch, INPUT_SPACE).zero_() # last_note: (batch, INPUT_SPACE)
-        else:
-            cond_h, cond_c = torch.zeros(batch, cond_size), torch.zeros(batch, cond_size) # cond_h: (batch, cond_size)
-            last_note = torch.zeros(batch, INPUT_SPACE) # last_note: (batch, INPUT_SPACE)
+        
+        device = z.device
+        cond_h = torch.zeros(batch, cond_size, device=device) # cond_h: (batch, cond_size)
+        cond_c = torch.zeros(batch, cond_size, device=device)
+        last_note = torch.zeros(batch, INPUT_SPACE, device=device) # last_note: (batch, INPUT_SPACE)
+
         notes = []
         for i in range(seq_len):
             new_notes, cond_h, cond_c = self._decode_single_bar(last_note, cond_init, cond_h, cond_c) # new_notes [(batch, INPUT_SPACE)]
@@ -212,8 +182,9 @@ class MusicVAE(pl.LightningModule):
         out = self._decode(z, seq_len) # out: (batch, seq_len*16, INPUT_SPACE)
         return out, (mu, logvar)
 
+
 class VAETrainer():
-    def __init__(self, hparams: HParams, train_loader, test_loader, use_cuda=None, log_base_dir='runs'):
+    def __init__(self, hparams: HParams, batch_dir, use_cuda=None, log_base_dir='runs'):
         self.hparams = hparams
         self.hp_dict = dict(self.hparams._asdict())
         
@@ -223,8 +194,7 @@ class VAETrainer():
             self.use_cuda = use_cuda and torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         
-        self.train_loader = train_loader
-        self.test_loader = test_loader
+        self.train_loader, self.test_loader = get_data(batch_dir)
         
         self.model = MusicVAE(hparams, self.use_cuda).to(self.device)
         self.optim = torch.optim.Adam(self.model.parameters(), lr=hparams.lr)
@@ -236,17 +206,33 @@ class VAETrainer():
         self.writer = SummaryWriter(log_dir)
         
         self.checkpoint_dir = os.path.join(base_dir, 'checkpoints')
-        
-#         self.exp = Experiment('Music VAE')
-#         print('Hyperparameters: ')
-#         for k, v in self.hp_dict.items():
-#             self.exp.param(k, v)
-#         print()
-        
-    def _loss_function(self, recon_x, x, mu, logvar):
-        BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return BCE + KLD
+
+    def prepare_data(self):
+        self.dataset = MelodySequenceDataset(self.batch_dir)
+        dl = len(self.dataset)
+        train_l = int(TRAIN_RATIO * dl)
+        test_l = dl - train_l
+        self.train_set, self.test_set = torch.utils.data.random_split(self.dataset, [train_l, test_l])
+    
+    def train_dataloader(self):
+        train_loader = torch.utils.data.DataLoader(self.train_set, batch_size=None)
+        return train_loader
+    
+    def test_dataloader(self):
+        test_loader = torch.utils.data.DataLoader(self.test_set, batch_size=None)
+        return test_loader
+
+    
+    def get_kl_div(self, mu, logvar):
+        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    def get_recon_loss(self, recon_x, x):
+        return F.binary_cross_entropy(recon_x, x, reduction='sum')
+    
+    def get_total_loss(self, kld, bce):
+        # free_nats = self._hparams.free_bits * math.log(2.0)
+        beta = ((1.0 - math.pow(self._hparams.beta_rate, float(self.step))) * self._hparams.max_beta)
+        return bce + beta * kld
 
 #     @snoop
     def _onehot(self, in_batch):
@@ -268,42 +254,55 @@ class VAETrainer():
         self.model.eval()
         test_loss = 0
         batches = 0
-        with tqdm(self.test_loader, total=len(self.test_loader), desc='Testing batch', file=sys.stdout):
-            for batch in (self.test_loader):
-                x = self._onehot(batch)
-                out, (mu, logvar) = self.model(x)
-                loss = self._loss_function(out, x, mu, logvar)
-                
-                test_loss += loss
-                batches += 1
+        for batch in tqdm(self.test_loader, total=len(self.test_loader), desc='Testing batch', file=sys.stdout):
+            x = self._onehot(batch)
+            out, (mu, logvar) = self.model(x)
+            
+            kld = self.get_kl_div(mu, logvar)
+            bce = self.get_recon_loss(out, x)
+            loss = self.get_total_loss(kld, bce)
+            
+            test_loss += loss
+            batches += 1
         return test_loss / batches
     
     def _train_epoch(self):
         self.model.train()
         train_loss = 0
+        kld_acc = 0
+        bce_acc = 0
         batches = 0
         for batch in tqdm(self.train_loader, total=len(self.train_loader), desc='Training batch', file=sys.stdout):
-            x = self._onehot(batch)
             self.optim.zero_grad()
-            
+
+            x = self._onehot(batch)
             out, (mu, logvar) = self.model(x)
 
-            loss = self._loss_function(out, x, mu, logvar)
+            kld = self.get_kl_div(mu, logvar)
+            bce = self.get_recon_loss(out, x)
+            loss = self.get_total_loss(kld, bce)
             
             loss.backward()
             self.optim.step()
+
             train_loss += loss.item()
+            kld_acc += kld.item()
+            bce_acc += bce.item()
             batches += 1
-        return train_loss / batches
+        return train_loss / batches, kld_acc / batches, bce_acc / batches
     
-    def train(self, n_epochs, checkpoint_freq=10):
+    def train(self, n_epochs, checkpoint_freq=2):
         print(f'Train for {n_epochs} epochs')
         for epoch in range(n_epochs):
             print(f'Epoch {epoch}/{n_epochs}...', end='')
-            train_loss = self._train_epoch()
+            train_loss, kld, bce = self._train_epoch()
             
             self.writer.add_scalar('train_loss', train_loss)
             self.exp.metric('train_loss', train_loss)
+            self.writer.add_scalar('kl_div', kld)
+            self.exp.metric('kl_div', kld)
+            self.writer.add_scalar('recon_loss', bce)
+            self.exp.metric('recon_loss', bce)
             
             test_loss = self.test()
             
